@@ -1,0 +1,187 @@
+apiVersion: v1
+kind: List
+items:
+  - apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: streaming-platform-config
+      namespace: enterprise-data-staging
+      labels:
+        app.kubernetes.io/managed-by: helm
+        app.kubernetes.io/component: topology
+        environment: staging
+    data:
+      pipelines.yaml: |
+        pipelines:
+
+          customer-360-pipeline:
+            description: Unified customer profile builder - staging
+
+            kafkas:
+              sourceKafka:
+                bootstrapServers: kafka-customer-staging.kafka.svc:9092
+                topics:
+                  - crm.customers
+                  - orders.events
+                  - support.tickets
+
+              profileKafka:
+                bootstrapServers: kafka-profile-staging.kafka.svc:9092
+                topics:
+                  - customer.timeline
+                  - customer.profile
+
+            services:
+
+              csharp-crm-normalizer:
+                type: dotnet-worker
+                replicas: 2
+                consumes:
+                  - kafka://sourceKafka/crm.customers
+                produces:
+                  - kafka://profileKafka/customer.profile
+
+              flink-customer-joiner:
+                type: flink-job
+                replicas: 4
+                consumes:
+                  - kafka://sourceKafka/orders.events
+                  - kafka://sourceKafka/support.tickets
+                  - kafka://profileKafka/customer.profile
+                produces:
+                  - kafka://profileKafka/customer.timeline
+
+              csharp-profile-indexer:
+                type: dotnet-worker
+                replicas: 2
+                consumes:
+                  - kafka://profileKafka/customer.timeline
+                writesTo:
+                  - elastic://elastic-customer-staging/customer-360-staging-*
+
+            databases:
+
+              elastic-customer-staging:
+                type: elasticsearch
+                url: https://elastic-customer-staging-es-http.elastic.svc:9200
+
+          experimentation-pipeline:
+            description: Feature flag experiment events and metrics
+
+            kafkas:
+              eventKafka:
+                bootstrapServers: kafka-experimentation.kafka.svc:9092
+                topics:
+                  - experiments.exposed
+                  - experiments.clicked
+                  - experiments.converted
+
+              metricKafka:
+                bootstrapServers: kafka-experimentation-metrics.kafka.svc:9092
+                topics:
+                  - experiments.scored
+                  - experiments.anomalies
+
+            services:
+
+              csharp-experiment-scorer:
+                type: dotnet-worker
+                replicas: 3
+                consumes:
+                  - kafka://eventKafka/experiments.exposed
+                  - kafka://eventKafka/experiments.clicked
+                  - kafka://eventKafka/experiments.converted
+                produces:
+                  - kafka://metricKafka/experiments.scored
+
+              flink-anomaly-detector:
+                type: flink-job
+                replicas: 5
+                consumes:
+                  - kafka://metricKafka/experiments.scored
+                produces:
+                  - kafka://metricKafka/experiments.anomalies
+
+              csharp-metric-writer:
+                type: dotnet-worker
+                replicas: 2
+                consumes:
+                  - kafka://metricKafka/experiments.anomalies
+                writesTo:
+                  - elastic://elastic-experimentation/experiment-metrics-*
+                  - oracle://oracle-experimentation/EXPERIMENT_ANOMALIES
+
+            databases:
+
+              elastic-experimentation:
+                type: elasticsearch
+                url: https://elastic-experimentation-es-http.elastic.svc:9200
+
+              oracle-experimentation:
+                type: oracle
+                host: oracle-experimentation.oracle.svc
+                serviceName: EXPSTAGE
+
+  - apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: payment-streams-config
+      namespace: commerce-staging
+      labels:
+        app.kubernetes.io/managed-by: helm
+        app.kubernetes.io/component: topology
+        environment: staging
+    data:
+      pipelines.yaml: |
+        pipelines:
+
+          checkout-observability-pipeline:
+            description: Checkout telemetry and latency anomaly detection
+
+            kafkas:
+              telemetryKafka:
+                bootstrapServers: kafka-checkout-telemetry.kafka.svc:9092
+                topics:
+                  - checkout.requests
+                  - checkout.errors
+                  - checkout.latency
+
+              alertKafka:
+                bootstrapServers: kafka-checkout-alerts.kafka.svc:9092
+                topics:
+                  - checkout.health
+                  - checkout.alerts
+
+            services:
+
+              csharp-checkout-health:
+                type: dotnet-worker
+                replicas: 3
+                consumes:
+                  - kafka://telemetryKafka/checkout.requests
+                  - kafka://telemetryKafka/checkout.errors
+                produces:
+                  - kafka://alertKafka/checkout.health
+
+              flink-latency-anomaly:
+                type: flink-job
+                replicas: 6
+                consumes:
+                  - kafka://telemetryKafka/checkout.latency
+                  - kafka://alertKafka/checkout.health
+                produces:
+                  - kafka://alertKafka/checkout.alerts
+
+              csharp-checkout-alert-writer:
+                type: dotnet-worker
+                replicas: 2
+                consumes:
+                  - kafka://alertKafka/checkout.alerts
+                writesTo:
+                  - elastic://elastic-commerce-staging/checkout-alerts-*
+
+            databases:
+
+              elastic-commerce-staging:
+                type: elasticsearch
+                url: https://elastic-commerce-staging-es-http.elastic.svc:9200

@@ -1,0 +1,450 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: streaming-platform-config
+  namespace: enterprise-data
+  labels:
+    app.kubernetes.io/managed-by: helm
+    app.kubernetes.io/component: topology
+    environment: production
+  annotations:
+    openshift.io/generated-by: topology-exporter
+    exportTimestamp: "2026-05-06T21:04:11Z"
+
+data:
+  pipelines.yaml: |
+    pipelines:
+
+      fraud-detection-pipeline:
+        description: Real-time payment fraud enrichment
+
+        kafkas:
+          ingestKafka:
+            bootstrapServers: kafka-payments-bootstrap.kafka.svc:9092
+            topics:
+              - payments.raw
+              - cards.raw
+              - users.raw
+
+          enrichmentKafka:
+            bootstrapServers: kafka-enrichment-bootstrap.kafka.svc:9092
+            topics:
+              - payments.enriched
+              - fraud.alerts
+              - fraud.errors
+
+        services:
+
+          nifi-payments-ingest:
+            type: nifi
+            outputs:
+              - kafka://ingestKafka/payments.raw
+              - kafka://ingestKafka/cards.raw
+
+          csharp-payment-enricher:
+            type: dotnet-worker
+            replicas: 8
+            image: registry.internal/fraud/payment-enricher:2.4.1
+            consumes:
+              - kafka://ingestKafka/payments.raw
+            produces:
+              - kafka://enrichmentKafka/payments.enriched
+            dependencies:
+              - oracle-payments
+              - elastic-customer-reference
+
+          flink-fraud-correlator:
+            type: flink-job
+            replicas: 16
+            image: registry.internal/fraud/flink-fraud-correlator:1.8.0
+            consumes:
+              - kafka://enrichmentKafka/payments.enriched
+              - kafka://ingestKafka/users.raw
+            produces:
+              - kafka://enrichmentKafka/fraud.alerts
+            stateBackend: rocksdb
+            checkpointIntervalMs: 30000
+
+          csharp-fraud-db-writer:
+            type: dotnet-worker
+            replicas: 4
+            consumes:
+              - kafka://enrichmentKafka/fraud.alerts
+            writesTo:
+              - oracle://oracle-payments/FRAUD_ALERTS
+              - elastic://elastic-fraud/fraud-alerts-*
+
+        databases:
+
+          oracle-payments:
+            type: oracle
+            host: oracle-payments.oracle.svc
+            serviceName: PAYPROD
+
+          elastic-fraud:
+            type: elasticsearch
+            url: https://elastic-fraud-es-http.elastic.svc:9200
+
+          elastic-customer-reference:
+            type: elasticsearch
+            url: https://elastic-customer-ref-es-http.elastic.svc:9200
+
+      telecom-enrichment-pipeline:
+        description: Telecom CDR processing and enrichment
+
+        kafkas:
+          rawKafka:
+            bootstrapServers: kafka-telco-bootstrap.kafka.svc:9092
+            topics:
+              - cdr.raw
+              - subscriber.raw
+              - tower.events
+
+          processedKafka:
+            bootstrapServers: kafka-telco-processed.kafka.svc:9092
+            topics:
+              - cdr.enriched
+              - roaming.detected
+              - telecom.analytics
+
+        services:
+
+          csharp-cdr-parser:
+            type: dotnet-worker
+            replicas: 12
+            image: registry.internal/telco/cdr-parser:5.1.0
+            consumes:
+              - kafka://rawKafka/cdr.raw
+            produces:
+              - kafka://processedKafka/cdr.enriched
+
+          flink-roaming-detector:
+            type: flink-job
+            replicas: 20
+            image: registry.internal/telco/flink-roaming-detector:2.0.0
+            consumes:
+              - kafka://processedKafka/cdr.enriched
+              - kafka://rawKafka/tower.events
+            produces:
+              - kafka://processedKafka/roaming.detected
+
+          flink-telecom-analytics:
+            type: flink-job
+            replicas: 10
+            image: registry.internal/telco/flink-analytics:1.3.9
+            consumes:
+              - kafka://processedKafka/cdr.enriched
+              - kafka://processedKafka/roaming.detected
+            produces:
+              - kafka://processedKafka/telecom.analytics
+
+          csharp-telecom-storage:
+            type: dotnet-worker
+            replicas: 6
+            consumes:
+              - kafka://processedKafka/telecom.analytics
+            writesTo:
+              - oracle://oracle-telco/TELCO_ANALYTICS
+              - elastic://elastic-telco/telco-analytics-*
+
+        databases:
+
+          oracle-telco:
+            type: oracle
+            host: oracle-telco.oracle.svc
+            serviceName: TELCOPROD
+
+          elastic-telco:
+            type: elasticsearch
+            url: https://elastic-telco-es-http.elastic.svc:9200
+
+      cyber-security-pipeline:
+        description: SIEM event aggregation and threat correlation
+
+        kafkas:
+          securityKafka:
+            bootstrapServers: kafka-security-bootstrap.kafka.svc:9092
+            topics:
+              - firewall.logs
+              - endpoint.events
+              - auth.logs
+              - dns.logs
+
+          alertKafka:
+            bootstrapServers: kafka-alerts-bootstrap.kafka.svc:9092
+            topics:
+              - threats.detected
+              - incidents.opened
+              - siem.correlated
+
+        services:
+
+          nifi-security-ingest:
+            type: nifi
+            outputs:
+              - kafka://securityKafka/firewall.logs
+              - kafka://securityKafka/auth.logs
+              - kafka://securityKafka/dns.logs
+
+          csharp-threat-enricher:
+            type: dotnet-worker
+            replicas: 14
+            image: registry.internal/security/threat-enricher:7.0.2
+            consumes:
+              - kafka://securityKafka/firewall.logs
+              - kafka://securityKafka/endpoint.events
+            produces:
+              - kafka://alertKafka/siem.correlated
+            dependencies:
+              - elastic-threat-intel
+
+          flink-threat-correlator:
+            type: flink-job
+            replicas: 32
+            image: registry.internal/security/flink-threat-correlator:4.2.0
+            consumes:
+              - kafka://alertKafka/siem.correlated
+              - kafka://securityKafka/auth.logs
+              - kafka://securityKafka/dns.logs
+            produces:
+              - kafka://alertKafka/threats.detected
+              - kafka://alertKafka/incidents.opened
+            checkpointStorage: s3://flink-security-checkpoints/prod
+
+          csharp-siem-writer:
+            type: dotnet-worker
+            replicas: 8
+            consumes:
+              - kafka://alertKafka/threats.detected
+              - kafka://alertKafka/incidents.opened
+            writesTo:
+              - elastic://elastic-siem/siem-events-*
+              - oracle://oracle-security/INCIDENTS
+
+        databases:
+
+          elastic-siem:
+            type: elasticsearch
+            url: https://elastic-siem-es-http.elastic.svc:9200
+
+          elastic-threat-intel:
+            type: elasticsearch
+            url: https://elastic-threatintel-es-http.elastic.svc:9200
+
+          oracle-security:
+            type: oracle
+            host: oracle-security.oracle.svc
+            serviceName: SECOPS
+
+      customer-360-pipeline:
+        description: Unified customer profile builder
+
+        kafkas:
+          sourceKafka:
+            bootstrapServers: kafka-customer-bootstrap.kafka.svc:9092
+            topics:
+              - crm.customers
+              - orders.events
+              - support.tickets
+              - website.activity
+
+          profileKafka:
+            bootstrapServers: kafka-profile-bootstrap.kafka.svc:9092
+            topics:
+              - customer.timeline
+              - customer.profile
+              - customer.activity
+
+        services:
+
+          csharp-crm-normalizer:
+            type: dotnet-worker
+            replicas: 5
+            consumes:
+              - kafka://sourceKafka/crm.customers
+            produces:
+              - kafka://profileKafka/customer.profile
+
+          flink-customer-joiner:
+            type: flink-job
+            replicas: 18
+            image: registry.internal/customer/flink-customer-joiner:3.5.0
+            consumes:
+              - kafka://sourceKafka/orders.events
+              - kafka://sourceKafka/support.tickets
+              - kafka://sourceKafka/website.activity
+              - kafka://profileKafka/customer.profile
+            produces:
+              - kafka://profileKafka/customer.timeline
+
+          csharp-profile-indexer:
+            type: dotnet-worker
+            replicas: 6
+            consumes:
+              - kafka://profileKafka/customer.timeline
+            writesTo:
+              - elastic://elastic-customer/customer-360-*
+              - oracle://oracle-customer/CUSTOMER_TIMELINE
+
+        databases:
+
+          elastic-customer:
+            type: elasticsearch
+            url: https://elastic-customer-es-http.elastic.svc:9200
+
+          oracle-customer:
+            type: oracle
+            host: oracle-customer.oracle.svc
+            serviceName: CUSTOMERDB
+
+      logistics-control-tower-pipeline:
+        description: Shipment telemetry aggregation and ETA propagation
+
+        kafkas:
+          edgeKafka:
+            bootstrapServers: kafka-logistics-edge.kafka.svc:9092
+            topics:
+              - shipment.events
+              - vehicle.location
+              - weather.alerts
+
+          analyticsKafka:
+            bootstrapServers: kafka-logistics-analytics.kafka.svc:9092
+            topics:
+              - shipment.enriched
+              - eta.predictions
+              - exceptions.detected
+
+        services:
+
+          nifi-shipment-ingest:
+            type: nifi
+            outputs:
+              - kafka://edgeKafka/shipment.events
+              - kafka://edgeKafka/vehicle.location
+
+          csharp-shipment-enricher:
+            type: dotnet-worker
+            replicas: 7
+            consumes:
+              - kafka://edgeKafka/shipment.events
+            produces:
+              - kafka://analyticsKafka/shipment.enriched
+            dependencies:
+              - elastic-route-cache
+
+          flink-eta-predictor:
+            type: flink-job
+            replicas: 22
+            image: registry.internal/logistics/flink-eta-predictor:2.8.1
+            consumes:
+              - kafka://analyticsKafka/shipment.enriched
+              - kafka://edgeKafka/vehicle.location
+              - kafka://edgeKafka/weather.alerts
+            produces:
+              - kafka://analyticsKafka/eta.predictions
+              - kafka://analyticsKafka/exceptions.detected
+
+          csharp-logistics-writer:
+            type: dotnet-worker
+            replicas: 5
+            consumes:
+              - kafka://analyticsKafka/eta.predictions
+              - kafka://analyticsKafka/exceptions.detected
+            writesTo:
+              - elastic://elastic-logistics/control-tower-*
+              - oracle://oracle-logistics/SHIPMENT_TIMELINE
+
+        databases:
+
+          elastic-route-cache:
+            type: elasticsearch
+            url: https://elastic-route-cache-es-http.elastic.svc:9200
+
+          elastic-logistics:
+            type: elasticsearch
+            url: https://elastic-logistics-es-http.elastic.svc:9200
+
+          oracle-logistics:
+            type: oracle
+            host: oracle-logistics.oracle.svc
+            serviceName: LOGIPROD
+
+      retail-recommendation-pipeline:
+        description: Streaming basket scoring and recommendation fanout
+
+        kafkas:
+          transactionKafka:
+            bootstrapServers: kafka-retail-ingest.kafka.svc:9092
+            topics:
+              - baskets.created
+              - customer.sessions
+              - inventory.delta
+
+          recommendationKafka:
+            bootstrapServers: kafka-retail-recs.kafka.svc:9092
+            topics:
+              - baskets.scored
+              - offers.generated
+              - personalization.audit
+
+        services:
+
+          csharp-basket-scorer:
+            type: dotnet-worker
+            replicas: 11
+            consumes:
+              - kafka://transactionKafka/baskets.created
+              - kafka://transactionKafka/customer.sessions
+            produces:
+              - kafka://recommendationKafka/baskets.scored
+
+          flink-offer-generator:
+            type: flink-job
+            replicas: 14
+            image: registry.internal/retail/flink-offer-generator:6.2.0
+            consumes:
+              - kafka://recommendationKafka/baskets.scored
+              - kafka://transactionKafka/inventory.delta
+            produces:
+              - kafka://recommendationKafka/offers.generated
+              - kafka://recommendationKafka/personalization.audit
+
+          csharp-offer-indexer:
+            type: dotnet-worker
+            replicas: 4
+            consumes:
+              - kafka://recommendationKafka/offers.generated
+            writesTo:
+              - elastic://elastic-retail/recommendations-*
+              - oracle://oracle-retail/OFFERS_OUTBOX
+
+        databases:
+
+          elastic-retail:
+            type: elasticsearch
+            url: https://elastic-retail-es-http.elastic.svc:9200
+
+          oracle-retail:
+            type: oracle
+            host: oracle-retail.oracle.svc
+            serviceName: RETAILPROD
+
+    sharedInfrastructure:
+
+      monitoring:
+        prometheus: prometheus-operated.monitoring.svc:9090
+        grafana: grafana.monitoring.svc:3000
+        alertmanager: alertmanager-operated.monitoring.svc:9093
+
+      tracing:
+        otelCollector: otel-collector.observability.svc:4317
+        jaeger: jaeger-query.observability.svc:16686
+
+      storage:
+        flinkCheckpointBucket: s3://flink-checkpoints-prod
+        icebergWarehouse: s3://iceberg-warehouse-prod
+
+      ingress:
+        kongGateway: kong-proxy.kong.svc
+        apiGateway: api-gateway.apps.cluster.local

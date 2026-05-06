@@ -1,0 +1,4 @@
+<svg viewBox="0 0 64 64">
+  <path d="M18 16h28l8 16-8 16H18l-8-16z" fill="none" stroke="#7dd3fc" stroke-width="4"/>
+  <path d="M22 37V27h5.5c4 0 6.5 1.8 6.5 5s-2.5 5-6.5 5H22zm4-3h1.4c1.7 0 2.7-.7 2.7-2s-1-2-2.7-2H26v4zm11 3V27h3v10h-3zm7 0V27h3l4.5 5.7V27h3v10h-3l-4.5-5.7V37h-3z" fill="#7dd3fc"/>
+</svg>

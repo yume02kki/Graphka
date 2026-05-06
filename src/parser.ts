@@ -138,6 +138,44 @@ const inferNodeKind = (scheme: string): NodeKind => {
   return 'unknown';
 };
 
+const inferServiceIconKey = (serviceConfig: AnyRecord) => {
+  const type = typeof serviceConfig.type === 'string' ? serviceConfig.type.toLowerCase() : '';
+  if (type.includes('flink')) {
+    return 'flink';
+  }
+  if (type.includes('nifi')) {
+    return 'nifi';
+  }
+  if (type.includes('dotnet') || type.includes('csharp')) {
+    return 'dotnet';
+  }
+  return 'service';
+};
+
+const inferStoreIconKey = (databaseConfig: AnyRecord) => {
+  const type = typeof databaseConfig.type === 'string' ? databaseConfig.type.toLowerCase() : '';
+  if (type.includes('elastic')) {
+    return 'elasticsearch';
+  }
+  if (type.includes('oracle')) {
+    return 'oracle';
+  }
+  return 'database';
+};
+
+const inferReferenceIconKey = (parsed: ParsedReference) => {
+  if (parsed.scheme === 'kafka') {
+    return 'kafka';
+  }
+  if (parsed.scheme === 'elastic') {
+    return 'elasticsearch';
+  }
+  if (parsed.scheme === 'oracle') {
+    return 'oracle';
+  }
+  return 'database';
+};
+
 const buildPipelineGraph = (
   pipelineId: string,
   pipeline: PipelineDefinition,
@@ -203,6 +241,7 @@ const buildPipelineGraph = (
       column: 0,
       row: 0,
       meta: {
+        iconKey: inferReferenceIconKey(parsed),
         scheme: parsed.scheme,
         target: parsed.target,
       },
@@ -220,6 +259,7 @@ const buildPipelineGraph = (
       column: 0,
       row: 0,
       meta: {
+        iconKey: 'kafka',
         kafkaAlias,
         topics: asStringList(toRecord(kafkaConfig).topics),
         bootstrapServers: toRecord(kafkaConfig).bootstrapServers,
@@ -234,7 +274,10 @@ const buildPipelineGraph = (
       kind: 'database',
       column: 0,
       row: 0,
-      meta: { ...toRecord(databaseConfig) },
+      meta: {
+        iconKey: inferStoreIconKey(toRecord(databaseConfig)),
+        ...toRecord(databaseConfig),
+      },
     });
   }
 
@@ -246,7 +289,10 @@ const buildPipelineGraph = (
       kind: 'service',
       column: 0,
       row: 0,
-      meta: { ...serviceConfig },
+      meta: {
+        iconKey: inferServiceIconKey(serviceConfig),
+        ...serviceConfig,
+      },
     });
 
     for (const input of asStringList(serviceConfig.consumes)) {
@@ -322,182 +368,197 @@ const buildPipelineGraph = (
   }
 
   const edges = [...edgeMap.values()];
-  const serviceIds = [...nodeMap.values()].filter((node) => node.kind === 'service').map((node) => node.id);
-  const upstreamServices = new Map<string, string[]>();
-  const downstreamServices = new Map<string, string[]>();
+  const allNodes = [...nodeMap.values()];
+  const serviceIds = allNodes.filter((n) => n.kind === 'service').map((n) => n.id);
+
+  // Build adjacency for services through shared channels
+  const upstreamServices = new Map<string, Set<string>>();
+  const downstreamServices = new Map<string, Set<string>>();
 
   for (const [channel, consumers] of consumedChannels.entries()) {
     const producers = producedChannels.get(channel) ?? [];
     for (const consumerId of consumers) {
       for (const producerId of producers) {
-        upstreamServices.set(consumerId, [...(upstreamServices.get(consumerId) ?? []), producerId]);
-        downstreamServices.set(producerId, [...(downstreamServices.get(producerId) ?? []), consumerId]);
+        if (!upstreamServices.has(consumerId)) upstreamServices.set(consumerId, new Set());
+        upstreamServices.get(consumerId)!.add(producerId);
+        if (!downstreamServices.has(producerId)) downstreamServices.set(producerId, new Set());
+        downstreamServices.get(producerId)!.add(consumerId);
       }
     }
   }
 
-  const serviceDepthCache = new Map<string, number>();
-  const visitDepth = (serviceId: string, trail = new Set<string>()): number => {
-    if (serviceDepthCache.has(serviceId)) {
-      return serviceDepthCache.get(serviceId)!;
-    }
-    if (trail.has(serviceId)) {
-      return 0;
-    }
-    trail.add(serviceId);
-    const parents = upstreamServices.get(serviceId) ?? [];
-    const depth = parents.length ? Math.max(...parents.map((parent) => visitDepth(parent, new Set(trail)))) + 1 : 0;
-    serviceDepthCache.set(serviceId, depth);
+  // ── Column assignment (left-to-right depth) ──
+  // Services get odd columns; intermediaries (kafka/db) get even columns between them.
+  const depthCache = new Map<string, number>();
+  const computeDepth = (id: string, trail = new Set<string>()): number => {
+    if (depthCache.has(id)) return depthCache.get(id)!;
+    if (trail.has(id)) return 0;
+    trail.add(id);
+    const parents = [...(upstreamServices.get(id) ?? [])];
+    const depth = parents.length ? Math.max(...parents.map((p) => computeDepth(p, new Set(trail)))) + 1 : 0;
+    depthCache.set(id, depth);
     return depth;
   };
 
-  serviceIds.forEach((serviceId) => {
-    const node = nodeMap.get(serviceId)!;
-    node.column = visitDepth(serviceId) * 2 + 1;
-  });
+  for (const sid of serviceIds) {
+    nodeMap.get(sid)!.column = computeDepth(sid) * 2 + 1;
+  }
 
-  for (const node of nodeMap.values()) {
-    if (node.kind === 'kafka' || node.kind === 'database' || node.kind === 'unknown') {
-      const inbound = edges.filter((edge) => edge.to === node.id).map((edge) => nodeMap.get(edge.from)?.column ?? 1);
-      const outbound = edges.filter((edge) => edge.from === node.id).map((edge) => nodeMap.get(edge.to)?.column ?? 1);
+  // Place non-service nodes between their producers and consumers
+  for (const node of allNodes) {
+    if (node.kind === 'service') continue;
+    const inCols = edges.filter((e) => e.to === node.id).map((e) => nodeMap.get(e.from)?.column ?? 0);
+    const outCols = edges.filter((e) => e.from === node.id).map((e) => nodeMap.get(e.to)?.column ?? 0);
 
-      if (node.kind === 'kafka') {
-        if (inbound.length) {
-          node.column = Math.max(...inbound) + 1;
-        } else if (outbound.length) {
-          node.column = Math.max(0, Math.min(...outbound) - 1);
-        } else {
-          node.column = 0;
+    if (inCols.length && outCols.length) {
+      // Place halfway between max producer column and min consumer column
+      node.column = Math.round((Math.max(...inCols) + Math.min(...outCols)) / 2);
+    } else if (inCols.length) {
+      node.column = Math.max(...inCols) + 1;
+    } else if (outCols.length) {
+      node.column = Math.max(0, Math.min(...outCols) - 1);
+    } else {
+      node.column = 0;
+    }
+  }
+
+  // ── Row assignment (vertical spread) ──
+  // Goal: spread nodes vertically so the graph uses space well and data flow is readable.
+
+  // 1. Assign rows to services using topological order + fan-out spreading
+  const serviceDepths = serviceIds.map((id) => ({ id, depth: depthCache.get(id) ?? 0 }));
+  serviceDepths.sort((a, b) => a.depth - b.depth || a.id.localeCompare(b.id));
+
+  const rowAssignment = new Map<string, number>();
+
+  // Group services by depth layer
+  const layers = new Map<number, string[]>();
+  for (const { id, depth } of serviceDepths) {
+    if (!layers.has(depth)) layers.set(depth, []);
+    layers.get(depth)!.push(id);
+  }
+
+  // For each layer, spread services vertically.
+  // Downstream services are positioned near their upstream parents but fanned out.
+  const sortedDepths = [...layers.keys()].sort((a, b) => a - b);
+
+  for (const depth of sortedDepths) {
+    const layerServices = layers.get(depth)!;
+
+    if (depth === 0) {
+      // Root services: spread evenly
+      layerServices.sort((a, b) => {
+        const aDown = downstreamServices.get(a)?.size ?? 0;
+        const bDown = downstreamServices.get(b)?.size ?? 0;
+        return bDown - aDown || a.localeCompare(b);
+      });
+      layerServices.forEach((id, i) => {
+        rowAssignment.set(id, i);
+      });
+    } else {
+      // Non-root: position based on upstream parents, then fan out
+      const positioned: { id: string; target: number }[] = [];
+      for (const id of layerServices) {
+        const parents = [...(upstreamServices.get(id) ?? [])];
+        const parentRows = parents.map((p) => rowAssignment.get(p)).filter((r): r is number => r !== undefined);
+        const target = parentRows.length ? average(parentRows) : 0;
+        positioned.push({ id, target });
+      }
+
+      // Sort by target row, then fan out siblings that share the same parent
+      positioned.sort((a, b) => a.target - b.target || a.id.localeCompare(b.id));
+
+      // Group by shared parent set for fan-out
+      const parentKey = (id: string) => [...(upstreamServices.get(id) ?? [])].sort().join(',');
+      const groups = new Map<string, typeof positioned>();
+      for (const item of positioned) {
+        const key = parentKey(item.id);
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key)!.push(item);
+      }
+
+      for (const group of groups.values()) {
+        if (group.length > 1) {
+          const center = average(group.map((g) => g.target));
+          group.forEach((item, i) => {
+            item.target = center + (i - (group.length - 1) / 2) * 1.0;
+          });
         }
-      } else if (inbound.length) {
-        node.column = Math.max(...inbound) + 1;
-      } else if (outbound.length) {
-        node.column = Math.max(0, Math.min(...outbound) - 1);
-      } else {
-        node.column = 0;
+      }
+
+      // Re-sort after fan-out adjustment
+      positioned.sort((a, b) => a.target - b.target || a.id.localeCompare(b.id));
+
+      for (const item of positioned) {
+        rowAssignment.set(item.id, item.target);
       }
     }
   }
 
-  const preferredRows = new Map<string, number>();
-  const rootServices = serviceIds
-    .filter((serviceId) => !(upstreamServices.get(serviceId)?.length))
-    .sort((left, right) => (nodeMap.get(left)?.label ?? left).localeCompare(nodeMap.get(right)?.label ?? right));
-
-  rootServices.forEach((serviceId, index) => {
-    preferredRows.set(serviceId, index * 2.25);
-  });
-
-  const serviceRowCache = new Map<string, number>();
-  const visitRow = (serviceId: string, trail = new Set<string>()): number => {
-    if (serviceRowCache.has(serviceId)) {
-      return serviceRowCache.get(serviceId)!;
-    }
-    if (trail.has(serviceId)) {
-      return preferredRows.get(serviceId) ?? 0;
-    }
-
-    trail.add(serviceId);
-    const parents = upstreamServices.get(serviceId) ?? [];
-    const row = parents.length
-      ? average(parents.map((parent) => visitRow(parent, new Set(trail))))
-      : (preferredRows.get(serviceId) ?? 0);
-
-    serviceRowCache.set(serviceId, row);
-    return row;
-  };
-
-  serviceIds.forEach((serviceId) => {
-    preferredRows.set(serviceId, visitRow(serviceId));
-  });
-
-  for (const [parentId, childIds] of downstreamServices.entries()) {
-    const parentRow = preferredRows.get(parentId) ?? 0;
-    const siblings = [...new Set(childIds)].sort((left, right) =>
-      (nodeMap.get(left)?.label ?? left).localeCompare(nodeMap.get(right)?.label ?? right),
-    );
-    if (siblings.length <= 1) {
-      continue;
-    }
-
-    siblings.forEach((childId, index) => {
-      const offset = index - (siblings.length - 1) / 2;
-      preferredRows.set(childId, (preferredRows.get(childId) ?? parentRow) + offset * 0.9);
-    });
-  }
-
-  for (const node of nodeMap.values()) {
-    if (node.kind === 'service') {
-      continue;
-    }
-
+  // 2. Assign rows to non-service nodes
+  // Each non-service node is placed at the average row of its connected services,
+  // but if multiple non-service nodes share a column, spread them out.
+  for (const node of allNodes) {
+    if (node.kind === 'service') continue;
     const neighborRows = edges
-      .filter((edge) => edge.from === node.id || edge.to === node.id)
-      .map((edge) => {
-        const otherId = edge.from === node.id ? edge.to : edge.from;
-        return preferredRows.get(otherId);
+      .filter((e) => e.from === node.id || e.to === node.id)
+      .map((e) => {
+        const otherId = e.from === node.id ? e.to : e.from;
+        return rowAssignment.get(otherId);
       })
-      .filter((value): value is number => value !== undefined);
+      .filter((r): r is number => r !== undefined);
 
     if (neighborRows.length) {
-      preferredRows.set(node.id, average(neighborRows));
+      rowAssignment.set(node.id, average(neighborRows));
+    } else {
+      rowAssignment.set(node.id, 0);
     }
   }
 
-  for (const serviceId of serviceIds) {
-    const serviceRow = preferredRows.get(serviceId) ?? 0;
-    const sinkTargets = [...new Set(edges.filter((edge) => edge.from === serviceId).map((edge) => edge.to))]
-      .map((targetId) => nodeMap.get(targetId))
-      .filter((node): node is GraphNode => node !== undefined && node.kind !== 'service');
-
-    const groupedByColumn = new Map<number, GraphNode[]>();
-    sinkTargets.forEach((node) => {
-      const bucket = groupedByColumn.get(node.column) ?? [];
-      bucket.push(node);
-      groupedByColumn.set(node.column, bucket);
-    });
-
-    for (const bucket of groupedByColumn.values()) {
-      if (bucket.length <= 1) {
-        continue;
-      }
-
-      bucket
-        .sort((left, right) => left.label.localeCompare(right.label))
-        .forEach((node, index) => {
-          preferredRows.set(node.id, serviceRow + index * 1.1);
-        });
-    }
-  }
-
+  // 3. De-overlap: within each column, enforce minimum vertical spacing
   const nodesByColumn = new Map<number, GraphNode[]>();
-  for (const node of nodeMap.values()) {
-    const bucket = nodesByColumn.get(node.column) ?? [];
-    bucket.push(node);
-    nodesByColumn.set(node.column, bucket);
+  for (const node of allNodes) {
+    const col = node.column;
+    if (!nodesByColumn.has(col)) nodesByColumn.set(col, []);
+    nodesByColumn.get(col)!.push(node);
   }
 
   for (const bucket of nodesByColumn.values()) {
-    let lane = Number.NEGATIVE_INFINITY;
-    bucket
-      .sort((left, right) => {
-        const rowDifference = (preferredRows.get(left.id) ?? 0) - (preferredRows.get(right.id) ?? 0);
-        if (Math.abs(rowDifference) > 0.01) {
-          return rowDifference;
-        }
-        return left.label.localeCompare(right.label);
-      })
-      .forEach((node) => {
-        const targetLane = preferredRows.get(node.id) ?? 0;
-        lane = Math.max(lane + 1, Math.round(targetLane));
-        node.row = lane;
-      });
+    bucket.sort((a, b) => {
+      const diff = (rowAssignment.get(a.id) ?? 0) - (rowAssignment.get(b.id) ?? 0);
+      if (Math.abs(diff) > 0.001) return diff;
+      return a.label.localeCompare(b.label);
+    });
+
+    for (let i = 1; i < bucket.length; i++) {
+      const prevRow = rowAssignment.get(bucket[i - 1].id) ?? 0;
+      const curRow = rowAssignment.get(bucket[i].id) ?? 0;
+      if (curRow - prevRow < 1.0) {
+        rowAssignment.set(bucket[i].id, prevRow + 1.0);
+      }
+    }
   }
 
-  const nodes = [...nodeMap.values()].map((node) => ({
+  // 4. Center the whole layout vertically (shift so min row = 0)
+  const allRows = [...rowAssignment.values()];
+  const minRow = Math.min(...allRows);
+  if (minRow !== 0) {
+    for (const [id, row] of rowAssignment) {
+      rowAssignment.set(id, row - minRow);
+    }
+  }
+
+  // Apply column and row to nodes, convert to pixel positions
+  for (const node of allNodes) {
+    node.row = rowAssignment.get(node.id) ?? 0;
+  }
+
+  const COL_WIDTH = 320;
+  const ROW_HEIGHT = 180;
+  const nodes = allNodes.map((node) => ({
     ...node,
-    x: 180 + node.column * 280,
-    y: 170 + node.row * 190,
+    x: 200 + node.column * COL_WIDTH,
+    y: 160 + node.row * ROW_HEIGHT,
   }));
 
   return {

@@ -81,41 +81,28 @@ const wrapLabel = (value: string, size = 16) => {
   return lines.slice(0, 3);
 };
 
-const pathForEdge = (from: GraphNode, to: GraphNode, offset = 0) => {
+const pathForEdge = (from: GraphNode, to: GraphNode, _offset = 0) => {
   const fromSize = NODE_SIZE[from.kind];
   const toSize = NODE_SIZE[to.kind];
   const fx = from.x ?? 0;
   const fy = from.y ?? 0;
   const tx = to.x ?? 0;
   const ty = to.y ?? 0;
-  const direction = tx >= fx ? 1 : -1;
 
-  const startX = fx + (fromSize.width / 2) * direction;
-  const startY = fy + offset * 10;
-  const endX = tx - (toSize.width / 2) * direction;
-  const endY = ty + offset * 10;
+  // Pick exit/entry sides: right→left for forward, best side for others
+  const goesRight = tx > fx + 20;
+  const startX = goesRight ? fx + fromSize.width / 2 : (tx < fx - 20 ? fx - fromSize.width / 2 : fx);
+  const startY = goesRight || tx < fx - 20 ? fy : (ty > fy ? fy + fromSize.height / 2 : fy - fromSize.height / 2);
+  const endX = goesRight ? tx - toSize.width / 2 : (tx < fx - 20 ? tx + toSize.width / 2 : tx);
+  const endY = goesRight || tx < fx - 20 ? ty : (ty > fy ? ty - toSize.height / 2 : ty + toSize.height / 2);
 
-  const dx = Math.abs(endX - startX);
-  const cp = Math.max(60, dx * 0.35);
-
-  return [
-    `M ${startX} ${startY}`,
-    `C ${startX + cp * direction} ${startY + offset * 20},`,
-    `${endX - cp * direction} ${endY + offset * 20},`,
-    `${endX} ${endY}`,
-  ].join(' ');
+  return `M ${startX} ${startY} L ${endX} ${endY}`;
 };
 
-const edgeMidpoint = (from: GraphNode, to: GraphNode, offset = 0) => {
-  const fx = from.x ?? 0;
-  const fy = from.y ?? 0;
-  const tx = to.x ?? 0;
-  const ty = to.y ?? 0;
-  return {
-    x: (fx + tx) / 2,
-    y: (fy + ty) / 2 + offset * 18 - 12,
-  };
-};
+const edgeMidpoint = (from: GraphNode, to: GraphNode, offset = 0) => ({
+  x: ((from.x ?? 0) + (to.x ?? 0)) / 2,
+  y: ((from.y ?? 0) + (to.y ?? 0)) / 2 + offset * 16 - 10,
+});
 
 const graphDimensions = (graph: PipelineGraph) => {
   const width = Math.max(...graph.nodes.map((n) => (n.x ?? 0) + NODE_SIZE[n.kind].width / 2 + 180), 1400);

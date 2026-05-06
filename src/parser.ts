@@ -369,167 +369,174 @@ const buildPipelineGraph = (
 
   const edges = [...edgeMap.values()];
   const allNodes = [...nodeMap.values()];
-  const serviceIds = allNodes.filter((n) => n.kind === 'service').map((n) => n.id);
 
-  // Build adjacency for services through shared channels
-  const upstreamServices = new Map<string, Set<string>>();
-  const downstreamServices = new Map<string, Set<string>>();
-
-  for (const [channel, consumers] of consumedChannels.entries()) {
-    const producers = producedChannels.get(channel) ?? [];
-    for (const consumerId of consumers) {
-      for (const producerId of producers) {
-        if (!upstreamServices.has(consumerId)) upstreamServices.set(consumerId, new Set());
-        upstreamServices.get(consumerId)!.add(producerId);
-        if (!downstreamServices.has(producerId)) downstreamServices.set(producerId, new Set());
-        downstreamServices.get(producerId)!.add(consumerId);
-      }
-    }
+  // ── Build full directed adjacency on ALL nodes (not just services) ──
+  const predecessors = new Map<string, Set<string>>();
+  const successors = new Map<string, Set<string>>();
+  for (const edge of edges) {
+    if (!successors.has(edge.from)) successors.set(edge.from, new Set());
+    successors.get(edge.from)!.add(edge.to);
+    if (!predecessors.has(edge.to)) predecessors.set(edge.to, new Set());
+    predecessors.get(edge.to)!.add(edge.from);
   }
 
-  // ── Column assignment (left-to-right depth) ──
-  // Services get odd columns; intermediaries (kafka/db) get even columns between them.
-  const depthCache = new Map<string, number>();
-  const computeDepth = (id: string, trail = new Set<string>()): number => {
-    if (depthCache.has(id)) return depthCache.get(id)!;
-    if (trail.has(id)) return 0;
+  // ── Column assignment via longest-path layering on all nodes ──
+  // This gives each node a column based on its longest incoming path,
+  // which naturally spreads the graph left-to-right along data flow.
+  const colCache = new Map<string, number>();
+  const computeCol = (id: string, trail = new Set<string>()): number => {
+    if (colCache.has(id)) return colCache.get(id)!;
+    if (trail.has(id)) return 0; // cycle
     trail.add(id);
-    const parents = [...(upstreamServices.get(id) ?? [])];
-    const depth = parents.length ? Math.max(...parents.map((p) => computeDepth(p, new Set(trail)))) + 1 : 0;
-    depthCache.set(id, depth);
-    return depth;
+    const preds = [...(predecessors.get(id) ?? [])];
+    const col = preds.length
+      ? Math.max(...preds.map((p) => computeCol(p, new Set(trail)))) + 1
+      : 0;
+    colCache.set(id, col);
+    return col;
   };
 
-  for (const sid of serviceIds) {
-    nodeMap.get(sid)!.column = computeDepth(sid) * 2 + 1;
-  }
-
-  // Place non-service nodes between their producers and consumers
   for (const node of allNodes) {
-    if (node.kind === 'service') continue;
-    const inCols = edges.filter((e) => e.to === node.id).map((e) => nodeMap.get(e.from)?.column ?? 0);
-    const outCols = edges.filter((e) => e.from === node.id).map((e) => nodeMap.get(e.to)?.column ?? 0);
-
-    if (inCols.length && outCols.length) {
-      // Place halfway between max producer column and min consumer column
-      node.column = Math.round((Math.max(...inCols) + Math.min(...outCols)) / 2);
-    } else if (inCols.length) {
-      node.column = Math.max(...inCols) + 1;
-    } else if (outCols.length) {
-      node.column = Math.max(0, Math.min(...outCols) - 1);
-    } else {
-      node.column = 0;
-    }
+    node.column = computeCol(node.id);
   }
 
-  // ── Row assignment (vertical spread) ──
-  // Goal: spread nodes vertically so the graph uses space well and data flow is readable.
-
-  // 1. Assign rows to services using topological order + fan-out spreading
-  const serviceDepths = serviceIds.map((id) => ({ id, depth: depthCache.get(id) ?? 0 }));
-  serviceDepths.sort((a, b) => a.depth - b.depth || a.id.localeCompare(b.id));
+  // ── Row assignment ──
+  // Strategy: use the graph structure to assign initial rows, then de-overlap.
+  //
+  // 1. Find all "root" nodes (no predecessors) — these seed the layout.
+  // 2. BFS/topological order: assign each node a row based on where its
+  //    predecessors are, fanning out children of the same parent.
+  // 3. For nodes with multiple predecessors, use the median of parent rows.
+  // 4. De-overlap columns.
 
   const rowAssignment = new Map<string, number>();
 
-  // Group services by depth layer
-  const layers = new Map<number, string[]>();
-  for (const { id, depth } of serviceDepths) {
-    if (!layers.has(depth)) layers.set(depth, []);
-    layers.get(depth)!.push(id);
+  // Topological order (Kahn's algorithm), handles cycles gracefully
+  const inDegree = new Map<string, number>();
+  for (const node of allNodes) inDegree.set(node.id, 0);
+  for (const edge of edges) {
+    inDegree.set(edge.to, (inDegree.get(edge.to) ?? 0) + 1);
   }
 
-  // For each layer, spread services vertically.
-  // Downstream services are positioned near their upstream parents but fanned out.
-  const sortedDepths = [...layers.keys()].sort((a, b) => a - b);
+  const topoQueue: string[] = [];
+  for (const node of allNodes) {
+    if ((inDegree.get(node.id) ?? 0) === 0) topoQueue.push(node.id);
+  }
 
-  for (const depth of sortedDepths) {
-    const layerServices = layers.get(depth)!;
-
-    if (depth === 0) {
-      // Root services: spread evenly
-      layerServices.sort((a, b) => {
-        const aDown = downstreamServices.get(a)?.size ?? 0;
-        const bDown = downstreamServices.get(b)?.size ?? 0;
-        return bDown - aDown || a.localeCompare(b);
-      });
-      layerServices.forEach((id, i) => {
-        rowAssignment.set(id, i);
-      });
-    } else {
-      // Non-root: position based on upstream parents, then fan out
-      const positioned: { id: string; target: number }[] = [];
-      for (const id of layerServices) {
-        const parents = [...(upstreamServices.get(id) ?? [])];
-        const parentRows = parents.map((p) => rowAssignment.get(p)).filter((r): r is number => r !== undefined);
-        const target = parentRows.length ? average(parentRows) : 0;
-        positioned.push({ id, target });
-      }
-
-      // Sort by target row, then fan out siblings that share the same parent
-      positioned.sort((a, b) => a.target - b.target || a.id.localeCompare(b.id));
-
-      // Group by shared parent set for fan-out
-      const parentKey = (id: string) => [...(upstreamServices.get(id) ?? [])].sort().join(',');
-      const groups = new Map<string, typeof positioned>();
-      for (const item of positioned) {
-        const key = parentKey(item.id);
-        if (!groups.has(key)) groups.set(key, []);
-        groups.get(key)!.push(item);
-      }
-
-      for (const group of groups.values()) {
-        if (group.length > 1) {
-          const center = average(group.map((g) => g.target));
-          group.forEach((item, i) => {
-            item.target = center + (i - (group.length - 1) / 2) * 1.0;
-          });
-        }
-      }
-
-      // Re-sort after fan-out adjustment
-      positioned.sort((a, b) => a.target - b.target || a.id.localeCompare(b.id));
-
-      for (const item of positioned) {
-        rowAssignment.set(item.id, item.target);
-      }
+  const topoOrder: string[] = [];
+  const visited = new Set<string>();
+  while (topoQueue.length) {
+    // Sort queue so nodes with fewer connections come first (stable ordering)
+    topoQueue.sort((a, b) => (nodeMap.get(a)?.label ?? a).localeCompare(nodeMap.get(b)?.label ?? b));
+    const id = topoQueue.shift()!;
+    if (visited.has(id)) continue;
+    visited.add(id);
+    topoOrder.push(id);
+    for (const succ of (successors.get(id) ?? [])) {
+      const deg = (inDegree.get(succ) ?? 1) - 1;
+      inDegree.set(succ, deg);
+      if (deg <= 0 && !visited.has(succ)) topoQueue.push(succ);
     }
   }
-
-  // 2. Assign rows to non-service nodes
-  // Each non-service node is placed at the average row of its connected services,
-  // but if multiple non-service nodes share a column, spread them out.
+  // Add any remaining nodes (cycles)
   for (const node of allNodes) {
-    if (node.kind === 'service') continue;
-    const neighborRows = edges
-      .filter((e) => e.from === node.id || e.to === node.id)
-      .map((e) => {
-        const otherId = e.from === node.id ? e.to : e.from;
-        return rowAssignment.get(otherId);
-      })
+    if (!visited.has(node.id)) topoOrder.push(node.id);
+  }
+
+  // Assign rows in topological order
+  // Track how many children each parent has placed, to fan out
+  const childIndex = new Map<string, number>();
+
+  for (const id of topoOrder) {
+    const preds = [...(predecessors.get(id) ?? [])];
+    const parentRows = preds
+      .map((p) => rowAssignment.get(p))
       .filter((r): r is number => r !== undefined);
 
-    if (neighborRows.length) {
-      rowAssignment.set(node.id, average(neighborRows));
+    if (!parentRows.length) {
+      // Root node: stack roots vertically with generous spacing
+      const existingRoots = [...rowAssignment.values()];
+      const nextRow = existingRoots.length
+        ? Math.max(...existingRoots) + 1.5
+        : 0;
+      // But first check — maybe other roots at same column already placed
+      rowAssignment.set(id, nextRow);
     } else {
-      rowAssignment.set(node.id, 0);
+      // Place at median of parent rows
+      const sorted = [...parentRows].sort((a, b) => a - b);
+      const median = sorted[Math.floor(sorted.length / 2)];
+
+      // Offset based on how many siblings already placed from same parents
+      const parentKey = preds.sort().join(',');
+      const siblingIdx = childIndex.get(parentKey) ?? 0;
+      childIndex.set(parentKey, siblingIdx + 1);
+
+      // Count total siblings from this parent set
+      const totalSiblings = preds.length === 1
+        ? (successors.get(preds[0])?.size ?? 1)
+        : 1;
+      const fanOffset = totalSiblings > 1
+        ? (siblingIdx - (totalSiblings - 1) / 2) * 1.2
+        : 0;
+
+      rowAssignment.set(id, median + fanOffset);
     }
   }
 
-  // 3. De-overlap: within each column, enforce minimum vertical spacing
+  // De-overlap: within each column, enforce minimum vertical spacing
   const nodesByColumn = new Map<number, GraphNode[]>();
   for (const node of allNodes) {
-    const col = node.column;
-    if (!nodesByColumn.has(col)) nodesByColumn.set(col, []);
-    nodesByColumn.get(col)!.push(node);
+    if (!nodesByColumn.has(node.column)) nodesByColumn.set(node.column, []);
+    nodesByColumn.get(node.column)!.push(node);
   }
 
-  for (const bucket of nodesByColumn.values()) {
+  // Multiple passes to let adjustments propagate
+  for (let pass = 0; pass < 3; pass++) {
+    for (const [, bucket] of nodesByColumn) {
+      bucket.sort((a, b) => {
+        const diff = (rowAssignment.get(a.id) ?? 0) - (rowAssignment.get(b.id) ?? 0);
+        if (Math.abs(diff) > 0.001) return diff;
+        return a.label.localeCompare(b.label);
+      });
+
+      for (let i = 1; i < bucket.length; i++) {
+        const prevRow = rowAssignment.get(bucket[i - 1].id) ?? 0;
+        const curRow = rowAssignment.get(bucket[i].id) ?? 0;
+        if (curRow - prevRow < 1.0) {
+          rowAssignment.set(bucket[i].id, prevRow + 1.0);
+        }
+      }
+    }
+
+    // After de-overlapping, pull nodes toward the median of their neighbors
+    // to reduce edge lengths (but respect the de-overlap constraints)
+    for (const id of topoOrder) {
+      const neighbors: number[] = [];
+      for (const p of (predecessors.get(id) ?? [])) {
+        const r = rowAssignment.get(p);
+        if (r !== undefined) neighbors.push(r);
+      }
+      for (const s of (successors.get(id) ?? [])) {
+        const r = rowAssignment.get(s);
+        if (r !== undefined) neighbors.push(r);
+      }
+      if (!neighbors.length) continue;
+
+      neighbors.sort((a, b) => a - b);
+      const median = neighbors[Math.floor(neighbors.length / 2)];
+      const current = rowAssignment.get(id) ?? 0;
+      // Gently pull toward median
+      rowAssignment.set(id, current + (median - current) * 0.3);
+    }
+  }
+
+  // Final de-overlap pass
+  for (const [, bucket] of nodesByColumn) {
     bucket.sort((a, b) => {
       const diff = (rowAssignment.get(a.id) ?? 0) - (rowAssignment.get(b.id) ?? 0);
       if (Math.abs(diff) > 0.001) return diff;
       return a.label.localeCompare(b.label);
     });
-
     for (let i = 1; i < bucket.length; i++) {
       const prevRow = rowAssignment.get(bucket[i - 1].id) ?? 0;
       const curRow = rowAssignment.get(bucket[i].id) ?? 0;
@@ -539,26 +546,25 @@ const buildPipelineGraph = (
     }
   }
 
-  // 4. Center the whole layout vertically (shift so min row = 0)
+  // Center vertically: shift so min row = 0
   const allRows = [...rowAssignment.values()];
-  const minRow = Math.min(...allRows);
+  const minRow = allRows.length ? Math.min(...allRows) : 0;
   if (minRow !== 0) {
     for (const [id, row] of rowAssignment) {
       rowAssignment.set(id, row - minRow);
     }
   }
 
-  // Apply column and row to nodes, convert to pixel positions
   for (const node of allNodes) {
     node.row = rowAssignment.get(node.id) ?? 0;
   }
 
-  const COL_WIDTH = 320;
-  const ROW_HEIGHT = 180;
+  const COL_WIDTH = 340;
+  const ROW_HEIGHT = 200;
   const nodes = allNodes.map((node) => ({
     ...node,
-    x: 200 + node.column * COL_WIDTH,
-    y: 160 + node.row * ROW_HEIGHT,
+    x: 220 + node.column * COL_WIDTH,
+    y: 180 + node.row * ROW_HEIGHT,
   }));
 
   return {
